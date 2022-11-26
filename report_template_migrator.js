@@ -7,25 +7,37 @@
 
 import { launch } from 'puppeteer';
 import { parse } from 'yaml';
-import jsforce from "jsforce";
-import { promisify } from 'util';
-import { appendFile, readFileSync, writeFile as _writeFile } from 'fs';
+import jsforce from 'jsforce';
+import { appendFile, writeFile, readFile } from "fs/promises";
 import { config } from 'dotenv';
+import yargs from 'yargs';
+import { hideBin } from 'yargs/helpers';
 config();
 
-const customFieldIdRegex = /00N[a-zA-Z0-9]{12}/g;
-const jsonLayoutParamRegex = /j_id0%3Af%3AjsonLayout[^&?]*?=[^&?]*/;
-const imgTagRegex1 = /(?<=%3Cimg).*?(?=%2F%3E)/g;
-const imgTagRegex2 = /(?<=%3Cimg).*?(?=%3C%2Fimg%3E)/g;
-const emptyImgTag1 = '%3Cimg%2F%3E';
-const emptyImgTag2 = '%3Cimg%3C%2Fimg%3E';
-const writeFile = promisify(appendFile);
-const reportNamesFile = readFileSync('./config.yml', 'utf8');
+const argv = yargs(hideBin(process.argv))
+  .command("retrieve")
+  .command("deploy")
+  .command("all")
+  .option('headless', {
+    alias: 'x',
+    boolean: true,
+    default: false
+  })
+  .strictCommands()
+  .strictOptions()
+  .demandCommand(1, 2, "Please select a command", "Not more than 1 command available")
+  .argv;
+
+const CUSTOM_FIELD_ID_REGEX = /00N[a-zA-Z0-9]{12}/g;
+const JSON_LAYOUT_PARAM_REGEX = /j_id0%3Af%3AjsonLayout[^&?]*?=[^&?]*/;
+const IMG_TAG_REGEX_1 = /(?<=%3Cimg).*?(?=%2F%3E)/g;
+const IMG_TAG_REGEX_2 = /(?<=%3Cimg).*?(?=%3C%2Fimg%3E)/g;
+const EMPTY_IMG_TAG_1 = '%3Cimg%2F%3E';
+const EMPTY_IMG_TAG_2 = '%3Cimg%3C%2Fimg%3E';
+const reportNamesFile = await readFile('./config.yml', 'utf8');
 const yamlConfig = parse(reportNamesFile);
 const reportNames = yamlConfig.reportNames;
 const subtypesToMigrate = yamlConfig.reportSubtypesToMigrate;
-const CREATE_REPORTS_IN_TARGET_ORG = yamlConfig.createReportsInTargetOrg;
-const RUN_IN_BACKGROUND = yamlConfig.runInBackground;
 const LOG_POST_DATA = yamlConfig.writePOSTDataToFile;
 const ERROR_LOG_FILENAME = yamlConfig.errorLogFilename;
 const WINDOW_WIDTH = yamlConfig.windowWidth;
@@ -40,23 +52,16 @@ const SUPPORTED_SUBTYPES = {
   WOLI: 'Work Order Line Item',
 };
 
-let sourceAccessToken = process.env.SOURCE_ORG_ACCESS_TOKEN;
-let targetAccessToken = process.env.TARGET_ORG_ACCESS_TOKEN;
 let browser;
 let incognitoContext;
 let openedPages = [];
-let reportNameToURLMapSource = {};
-let reportNameToURLMapTarget = {};
 let reportNameToJSON = {};
 let reportNameToJSONReplaced = {};
 let customObjectIdsToLookup = [];
-let allSourceFieldIds = [];
 let sourceObjectIdToNameMap = {};
 let sourceObjectIdToSObject = {};
 let sourceObjectIdMap = {};
-let sourceFieldIdMap = {};
 let api_name_list = [];
-let keys_to_skip = [];
 
 function sleep(ms) {
   return new Promise(resolve => {
@@ -64,85 +69,115 @@ function sleep(ms) {
   });
 }
 
-const _throw = stringError => {
-  writeFile(ERROR_LOG_FILENAME, stringError).then(err => {
-    if (err) console.log(err);
-    throw new Error(`\r\n${stringError}\r\n`);
-  });
+const logAndExit = async stringError => {
+  try {
+    await appendFile(ERROR_LOG_FILENAME, stringError);
+  } catch (err) {
+    console.error(err);
+  }
+  throw new Error(`\r\n${stringError}\r\n`);
 };
 
-_writeFile(ERROR_LOG_FILENAME, '', { flag: 'wx' }, function (err) {});
+await writeFile(ERROR_LOG_FILENAME, '', { flag: 'a' });
 
 console.log('info: login to source environment');
-const sourceConnection = new jsforce.Connection({
-  loginUrl: process.env.SOURCE_ORG_LOGIN_URL,
-  accessToken: sourceAccessToken,
-});
-if (!sourceAccessToken) {
-  const userInfo = await sourceConnection.login(
-    process.env.SOURCE_ORG_USERNAME,
-    `${process.env.SOURCE_ORG_PASSWORD}${process.env.SOURCE_ORG_SECURITY_TOKEN}`,
-  );
-  sourceAccessToken = userInfo.accessToken;
-}
+const sourceConnection = await loginEnvironment(
+  process.env.SOURCE_ORG_LOGIN_URL,
+  process.env.SOURCE_ORG_ACCESS_TOKEN,
+  process.env.SOURCE_ORG_USERNAME,
+  process.env.SOURCE_ORG_PASSWORD,
+  process.env.SOURCE_ORG_SECURITY_TOKEN,
+)
 
 console.log('info: login to target environment');
-const targetConnection = new jsforce.Connection({
-  loginUrl: process.env.TARGET_ORG_LOGIN_URL,
-  accessToken: targetAccessToken,
-});
-if (!targetAccessToken) {
-  const userInfo = await targetConnection.login(
-    process.env.TARGET_ORG_USERNAME,
-    `${process.env.TARGET_ORG_PASSWORD}${process.env.TARGET_ORG_SECURITY_TOKEN}`,
-  );
-  targetAccessToken = userInfo.accessToken;
-}
+const targetConnection = await loginEnvironment(
+  process.env.TARGET_ORG_LOGIN_URL,
+  process.env.TARGET_ORG_ACCESS_TOKEN,
+  process.env.TARGET_ORG_USERNAME,
+  process.env.TARGET_ORG_PASSWORD,
+  process.env.TARGET_ORG_SECURITY_TOKEN,
+)
 
-console.log('info: opening browser');
+await validateReports(reportNames)
+
+console.log(`info: opening browser ${argv.headless && 'in headless mode' || ''}`);
 browser = await launch({
-  headless: RUN_IN_BACKGROUND,
+  headless: argv.headless,
   args: [`--window-size=${WINDOW_WIDTH},${WINDOW_HEIGHT}`],
   defaultViewport: {
     width: WINDOW_WIDTH,
     height: WINDOW_HEIGHT,
   },
 });
-incognitoContext = await browser.createIncognitoBrowserContext();
 
+incognitoContext = await browser.createIncognitoBrowserContext();
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
 console.log('info: Login to source in browser');
-await loginToSourceOrg();
+await loginToOrg(sourceConnection.loginUrl, sourceConnection.accessToken);
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
-console.log('info: Login to target in broser');
-await loginToTargetOrg();
+console.log('info: Login to target in browser');
+await loginToOrg(targetConnection.loginUrl, targetConnection.accessToken, true);
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
-if (CREATE_REPORTS_IN_TARGET_ORG === true) {
-  console.log('info: Creating reports in target');
-  await createReportsInTargetOrg();
-}
-console.log('info: Grabing source report links');
-await grabSourceOrgReportLinks();
+console.log('info: grabing source report links');
+const reportNameToURLMapSource = await grabSourceOrgReportLinks();
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
 console.log('info: Grabing source reports');
-await grabSourceOrgReportJSON();
+await grabSourceOrgReportJSON(reportNameToURLMapSource);
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
 console.log('info: Cleaning tabs');
 await cleanupTabs();
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
+console.log('info: extracting source org information')
 await extractSourceOrgCustomObjectsAndFields();
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
-await matchSourceToTargetOrgCustomObjectAndFieldIds();
+console.log('info: matching to target org information')
+const sourceFieldIdMap = await matchSourceToTargetOrgCustomObjectAndFieldIds();
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
-await replaceCustomFieldIds();
+console.log('info: replacing information in target org')
+await replaceCustomFieldIds(sourceFieldIdMap);
+console.log('info: Creating missing reports in target');
+await createReportsInTargetOrg(reportNames);
+console.log('info: Grabing target report links');
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
-await grabTargetOrgReportLinks();
+const reportNameToURLMapTarget = await grabTargetOrgReportLinks();
 await sleep(TIMEOUT_BETWEEN_ACTIONS);
-await deployReportTemplatesToTargetOrg();
+await deployReportTemplatesToTargetOrg(reportNameToURLMapTarget);
 
-console.log('ALL DONE!');
+console.log('info: success!');
 
 await browser.close();
+
+async function loginEnvironment(loginUrl, accessToken, username, password, token) {
+  const connection = new jsforce.Connection({
+    loginUrl,
+    accessToken,
+    instanceUrl: loginUrl,
+    version: '55.0',
+  });
+  if (!connection.accessToken) {
+    await sourceConnection.login(
+      username,
+      `${password}${token}`,
+    );
+  }
+  return connection;
+}
+
+/**
+ * 
+ * @param {String[]} reportNames 
+ */
+async function validateReports(reportNames) {
+  console.log('fine: validating reports in source org')
+  const response = await sourceConnection.query(`SELECT Id, DeveloperName FROM ServiceReportLayout WHERE DeveloperName IN ('${reportNames.join("','")}')`)
+  const reportsInOrg = new Set(response.records.map(report => report.DeveloperName));
+  const missingReports = reportNames
+    .filter(report => !reportsInOrg.has(report))
+
+  if (missingReports.length) {
+    throw new Error(`Missing reports ${missingReports.join(', ')}`)
+  }
+}
 
 async function logErrors(messagesArray) {
   console.error('The following errors happened:');
@@ -150,21 +185,13 @@ async function logErrors(messagesArray) {
   let formattedErrors = messagesArray.map(
     message => `${new Date().toLocaleString()} ${message}`,
   );
-  _throw(`${formattedErrors.join('\r\n')}\r\n`);
-}
-
-async function loginToSourceOrg() {
-  await loginToOrg(process.env.SOURCE_ORG_LOGIN_URL, sourceAccessToken, false);
-}
-
-async function loginToTargetOrg() {
-  await loginToOrg(process.env.TARGET_ORG_LOGIN_URL, targetAccessToken, true);
+  logAndExit(`${formattedErrors.join('\r\n')}\r\n`);
 }
 
 async function loginToOrg(loginUrl, accessToken, incognito) {
   if (!accessToken) {
     let message = 'Browser login failed. Please run this script again.';
-    _throw(`${new Date().toLocaleString()} ${message}\r\n`);
+    logAndExit(`${new Date().toLocaleString()} ${message}\r\n`);
   }
 
   let loginPage;
@@ -183,7 +210,7 @@ async function loginToOrg(loginUrl, accessToken, incognito) {
   if (pageUrl.includes('ec=302')) {
     //sometimes the frontdoor.jsp login doesn't work and the script needs to be restarted
     let message = 'Browser login failed. Please run this script again.';
-    _throw(`${new Date().toLocaleString()} ${message}\r\n`);
+    logAndExit(`${new Date().toLocaleString()} ${message}\r\n`);
   }
 }
 
@@ -196,7 +223,18 @@ async function cleanupTabs() {
 }
 
 async function createReportsInTargetOrg() {
-  for (let reportName of reportNames) {
+  const query = `SELECT Id, DeveloperName, MasterLabel, TemplateType FROM ServiceReportLayout WHERE DeveloperName IN ('${reportNames.join("','")}')`;
+  const response = await targetConnection.query(query)
+  const reportsInOrg = new Set(response.records.map(report => report.DeveloperName));
+  const missingReports = reportNames
+    .filter(report => !reportsInOrg.has(report))
+
+  if (!missingReports.length) {
+    console.log('fine: all records exist in target org, doing nothing...')
+  }
+
+  for (let reportName of missingReports) {
+    console.log(`fine: '${reportName}' does not exist or is inactive, creating it`)
     let newReportPage = await incognitoContext.newPage();
     await newReportPage.goto(
       `${process.env.TARGET_ORG_LOGIN_URL}/_ui/support/fieldservice/ui/ServiceReportTemplateClone/e?p1=${reportName}`,
@@ -208,6 +246,7 @@ async function createReportsInTargetOrg() {
 }
 
 async function grabSourceOrgReportLinks() {
+  const reportNameToURLMapSource = {};
   for (const reportName of reportNames) {
     console.log(`fine: getting report link for ${reportName}`);
     let newReportPage = await browser.newPage();
@@ -221,27 +260,31 @@ async function grabSourceOrgReportLinks() {
     );
     reportNameToURLMapSource[reportName] = reportLink;
   }
+  return reportNameToURLMapSource;
 }
 
-async function grabSourceOrgReportJSON() {
-  let requestsProcessed = [];
-
+async function grabSourceOrgReportJSON(reportNameToURLMapSource) {
   for (let reportSubtype of Object.keys(SUPPORTED_SUBTYPES)) {
     if (subtypesToMigrate.includes(reportSubtype)) {
       await grabSourceReport(
         reportSubtype,
         SUPPORTED_SUBTYPES[reportSubtype],
-        requestsProcessed,
-      );
+        reportNameToURLMapSource,
+      )
     }
   }
 }
 
-async function grabSourceReport(subtypeName, subtypeLabel, requestsProcessed) {
-  console.log(`fine: getting reports for subtype ${subtypeLabel}`);
+async function grabSourceReport(
+  subtypeName,
+  subtypeLabel,
+  reportNameToURLMapSource,
+) {
+  const requestsProcessed = []
+  console.log(`fine: getting reports for subtype '${subtypeLabel}'`);
   for (const currentReportName in reportNameToURLMapSource) {
     console.log(
-      `fine: getting report for ${currentReportName} for subtype ${subtypeLabel}`,
+      `fine: getting report for '${currentReportName}' for subtype '${subtypeLabel}'`,
     );
     const reportVersionName = `${currentReportName}_${subtypeName}`;
     const url = reportNameToURLMapSource[currentReportName];
@@ -268,7 +311,7 @@ async function grabSourceReport(subtypeName, subtypeLabel, requestsProcessed) {
         request_post_data.includes('j_id0%3Af%3AjsonLayout') &&
         !requestsProcessed.includes(reportVersionName)
       ) {
-        const regex = jsonLayoutParamRegex;
+        const regex = JSON_LAYOUT_PARAM_REGEX;
         const matched = regex.exec(request_post_data);
         reportNameToJSON[reportVersionName] = matched[0];
 
@@ -282,13 +325,12 @@ async function grabSourceReport(subtypeName, subtypeLabel, requestsProcessed) {
             2,
           );
 
-          _writeFile(
-            `${reportVersionName} source org POST data.json`,
+          writeFile(
+            `${reportVersionName}.source.json`,
             dataToWriteFormatted,
-            function (err) {
-              if (err) return console.log(err);
-            },
-          );
+          ).catch(err => {
+            console.error(err);
+          });
         }
 
         requestsProcessed.push(reportVersionName);
@@ -300,192 +342,156 @@ async function grabSourceReport(subtypeName, subtypeLabel, requestsProcessed) {
     });
 
     await clickQuickSave(newReportPage);
+    return requestsProcessed;
   }
 }
 
 async function extractSourceOrgCustomObjectsAndFields() {
+  const fieldIds = new Set()
   for (const currentReportName in reportNameToJSON) {
     const jsonString = reportNameToJSON[currentReportName];
-
-    const array = [...jsonString.matchAll(customFieldIdRegex)];
+    const array = [...jsonString.matchAll(CUSTOM_FIELD_ID_REGEX)];
     const results = array.flatMap(x => x[0]);
 
     for (const fieldId of results) {
-      if (!allSourceFieldIds.includes(fieldId)) {
-        allSourceFieldIds.push(fieldId);
-      }
+      fieldIds.add(fieldId)
     }
   }
 
-  for (const sourceFieldId of allSourceFieldIds) {
-    try {
-      const response = await sourceConnection.tooling.query(
-        `SELECT Id, DeveloperName, NamespacePrefix, TableEnumOrId FROM CustomField WHERE Id = '${sourceFieldId}'`,
-      );
-      if (response.records) {
-        console.log(res.records[0].DeveloperName);
-        api_name_list.push(res.records[0]);
+  const response = await sourceConnection.tooling.query(
+    `SELECT Id, DeveloperName, NamespacePrefix, TableEnumOrId FROM CustomField WHERE Id IN ('${[...fieldIds].join("', '")}')`,
+  );
+  response.records.forEach(record => {
+    if (response.records) {
+      api_name_list.push(record);
 
-        if (
-          res.records[0].TableEnumOrId.startsWith('01I') &&
-          !customObjectIdsToLookup.includes(res.records[0].TableEnumOrId)
-        ) {
-          console.log(
-            'adding source TableEnumOrId: ' + res.records[0].TableEnumOrId,
-          );
-          customObjectIdsToLookup.push(res.records[0].TableEnumOrId);
-        }
-      } else {
-        keys_to_skip.push(sourceFieldId);
+      if (
+        record.TableEnumOrId.startsWith('01I') &&
+        !customObjectIdsToLookup.includes(record.TableEnumOrId)
+      ) {
+        console.log(`adding source TableEnumOrId: ${record.TableEnumOrId}`);
+        customObjectIdsToLookup.push(record.TableEnumOrId);
       }
-    } catch (err) {
-      console.error(err);
     }
-  }
+  });
 
-  console.log('customObjectIdsToLookup:');
-  console.log(customObjectIdsToLookup);
-
-  for (const customObjectId of customObjectIdsToLookup) {
-    console.log('looking up custom object id ' + customObjectId);
-    await sourceConnection.tooling.query(
-      `SELECT Id, DeveloperName, NamespacePrefix FROM CustomObject WHERE Id = '${customObjectId}'`,
-      function (err, res) {
-        if (err) {
-          return console.error(err);
-        }
-
-        if (res && res.records) {
-          console.log(`custom object: ${res.records[0].DeveloperName}`);
-
-          sourceObjectIdToNameMap[customObjectId] = res.records[0];
-        }
-      },
-    );
+  console.log(`info: looking for customObjectIdsToLookup: ${customObjectIdsToLookup}`);
+  if (customObjectIdsToLookup.length) {
+    const responseCustomObject = await sourceConnection.tooling.query(
+      `SELECT Id, DeveloperName, NamespacePrefix FROM CustomObject WHERE Id IN ('${customObjectId.join("','")}')`
+    )
+    responseCustomObject.records.forEach((record) => {
+      console.log(`custom object: ${record.DeveloperName}`);
+      sourceObjectIdToNameMap[customObjectId] = record;
+    })
   }
 }
 
 async function matchSourceToTargetOrgCustomObjectAndFieldIds() {
   let missingObjects = [];
-  let missingFields = [];
 
   for (const sourceObjectId in sourceObjectIdToNameMap) {
     const customObject = sourceObjectIdToNameMap[sourceObjectId];
 
     if (customObject && customObject.DeveloperName) {
-      await targetConnection.tooling.query(
-        `SELECT Id, DeveloperName, NamespacePrefix FROM CustomObject WHERE DeveloperName = '${
-          customObject.DeveloperName
-        }' AND NamespacePrefix = '${
+      const query = `SELECT Id, DeveloperName, NamespacePrefix FROM CustomObject WHERE DeveloperName = '${
+        customObject.DeveloperName
+      }' AND NamespacePrefix = '${
+        customObject.NamespacePrefix == null
+          ? ''
+          : customObject.NamespacePrefix
+      }'`
+      const response = await targetConnection.tooling.query(query);
+      if (response.records && res.records[0]) {
+        let record = res.records[0];
+        sourceObjectIdMap[customObject.Id] = record.Id;
+        sourceObjectIdToSObject[customObject.Id] = record;
+        console.log(
+          `adding object source id: ${customObject.Id}, target id: ${record.Id}`,
+        );
+      } else {
+        let errorMessage = `custom object missing in target org: ${
           customObject.NamespacePrefix == null
             ? ''
-            : customObject.NamespacePrefix
-        }'`,
-        function (err, res) {
-          if (err) {
-            return console.error(err);
-          }
-
-          if (res && res.records && res.records[0]) {
-            let record = res.records[0];
-            sourceObjectIdMap[customObject.Id] = record.Id;
-            sourceObjectIdToSObject[customObject.Id] = record;
-            console.log(
-              `adding object source id: ${customObject.Id}, target id: ${record.Id}`,
-            );
-          } else {
-            let errorMessage = `custom object missing in target org: ${
-              customObject.NamespacePrefix == null
-                ? ''
-                : customObject.NamespacePrefix + '__'
-            }${customObject.DeveloperName}__c`;
-            missingObjects.push(errorMessage);
-          }
-        },
-      );
+            : customObject.NamespacePrefix + '__'
+        }${customObject.DeveloperName}__c`;
+        missingObjects.push(errorMessage);
+      }
     }
   }
 
   if (missingObjects.length) {
     logErrors(missingObjects);
   }
-
-  for (const customField of api_name_list) {
-    if (customField && customField.DeveloperName) {
-
-      if (customField.TableEnumOrId.startsWith('01I')) {
-        customField.TableEnumOrId =
-          sourceObjectIdMap[customField.TableEnumOrId];
-      }
-
-      console.log('running CustomField query:');
-      console.log(
-        `SELECT Id, DeveloperName, NamespacePrefix, TableEnumOrId FROM CustomField WHERE DeveloperName = '${
-          customField.DeveloperName
-        }' AND TableEnumOrId = '${
-          customField.TableEnumOrId
-        }' AND NamespacePrefix = '${
-          customField.NamespacePrefix == null ? '' : customField.NamespacePrefix
-        }'`,
-      );
-
-      await targetConnection.tooling.query(
-        `SELECT Id, DeveloperName, FullName, NamespacePrefix, TableEnumOrId FROM CustomField WHERE DeveloperName = '${
-          customField.DeveloperName
-        }' AND TableEnumOrId = '${
-          customField.TableEnumOrId
-        }' AND NamespacePrefix = '${
-          customField.NamespacePrefix == null ? '' : customField.NamespacePrefix
-        }'`,
-        function (err, res) {
-          if (err) {
-            return console.error(err);
-          }
-
-          if (res && res.records && res.records[0]) {
-            let record = res.records[0];
-            //-- for whatever reason the service report templates only use 15 character IDs
-            sourceFieldIdMap[customField.Id.substring(0, 15)] =
-              record.Id.substring(0, 15);
-          } else {
-            let errorMessage = `custom field ${customField.FullName} is missing in target org`;
-            missingFields.push(errorMessage);
-          }
-        },
-      );
-    }
+  
+  const getFieldApiName = (field) => {
+    const ns = field.NamespacePrefix ? field.NamespacePrefix : '';
+    const table = field.TableEnumOrId.startsWith('01I') ? 
+      sourceObjectIdMap[field.TableEnumOrId] :
+      field.TableEnumOrId;
+    return `${table}.${ns}${field.DeveloperName}`;
   }
+
+  const fieldFilters = api_name_list
+    .map(field => {
+      const ns = field.NamespacePrefix ? field.NamespacePrefix : '';
+      const dn = field.DeveloperName;
+      const table = field.TableEnumOrId.startsWith('01I') ? 
+        sourceObjectIdMap[field.TableEnumOrId] :
+        field.TableEnumOrId;
+      return `DeveloperName = '${dn}' AND TableEnumOrId = '${table}' AND NamespacePrefix = '${ns}'`
+    });
+  const fieldsByApi = Object.fromEntries(
+    api_name_list.map(field => [getFieldApiName(field), field])
+  );
+
+  const query2 = `SELECT Id, DeveloperName, NamespacePrefix, TableEnumOrId FROM CustomField WHERE (${
+    fieldFilters.join(') OR (')
+  })`
+
+  const response2 = await targetConnection.tooling.query(query2);
+  
+  const missingFields = response2.records
+    .filter(field => fieldsByApi[getFieldApiName(field)])
+    .keys();
+    
+  const sourceFieldIdMap = Object.fromEntries(response2.records
+    .filter(field => fieldsByApi[getFieldApiName(field)])  
+    .map(targetField => 
+      [fieldsByApi[getFieldApiName(targetField)].Id.substring(0, 15), targetField.Id.substring(0, 15)]
+    ))
 
   if (missingFields.length) {
-    logErrors(missingFields);
+    logErrors(`Missing fields in target org ${missingFields}`);
   }
+  
+  return sourceFieldIdMap;
 }
 
-async function replaceCustomFieldIds() {
+async function replaceCustomFieldIds(sourceFieldIdMap) {
   for (const currentReportName in reportNameToJSON) {
     let jsonString = reportNameToJSON[currentReportName];
-    const array = [...jsonString.matchAll(customFieldIdRegex)];
+    const array = [...jsonString.matchAll(CUSTOM_FIELD_ID_REGEX)];
     const results = array.flatMap(x => x[0]);
     console.log(
-      `Custom field Ids found in source org for ${currentReportName}:`,
+      `fine: custom field Ids found in source org for ${currentReportName}:`,
     );
-    console.log(results);
 
     for (const fieldId of results) {
       if (sourceFieldIdMap[fieldId]) {
         const targetOrgFieldId = sourceFieldIdMap[fieldId];
         console.log(
-          `Target org Id of source custom field ${fieldId}: ${targetOrgFieldId}`,
+          `fine: target org Id of source custom field ${fieldId}: ${targetOrgFieldId}`,
         );
         jsonString = jsonString.replaceAll(fieldId, targetOrgFieldId);
       }
     }
 
     if (REPLACE_SOURCE_IMAGES) {
-      jsonString = jsonString.replaceAll(imgTagRegex1, '');
-      jsonString = jsonString.replaceAll(imgTagRegex2, '');
-      jsonString = jsonString.replaceAll(emptyImgTag1, IMAGE_REPLACEMENT_TEXT);
-      jsonString = jsonString.replaceAll(emptyImgTag2, IMAGE_REPLACEMENT_TEXT);
+      jsonString = jsonString.replaceAll(IMG_TAG_REGEX_1, '');
+      jsonString = jsonString.replaceAll(IMG_TAG_REGEX_2, '');
+      jsonString = jsonString.replaceAll(EMPTY_IMG_TAG_1, IMAGE_REPLACEMENT_TEXT);
+      jsonString = jsonString.replaceAll(EMPTY_IMG_TAG_2, IMAGE_REPLACEMENT_TEXT);
     }
 
     reportNameToJSONReplaced[currentReportName] = jsonString;
@@ -493,6 +499,7 @@ async function replaceCustomFieldIds() {
 }
 
 async function grabTargetOrgReportLinks() {
+  const reportNameToURLMapTarget = {};
   for (const reportName of reportNames) {
     let newReportPage = await incognitoContext.newPage();
     await newReportPage.goto(
@@ -505,18 +512,22 @@ async function grabTargetOrgReportLinks() {
     );
     reportNameToURLMapTarget[reportName] = reportLink;
   }
+  return reportNameToURLMapTarget;
 }
 
-async function deployReportTemplatesToTargetOrg() {
+async function deployReportTemplatesToTargetOrg(reportNameToURLMapTarget) {
   let requestsProcessed = [];
 
   for (let reportSubtype of Object.keys(SUPPORTED_SUBTYPES)) {
     if (subtypesToMigrate.includes(reportSubtype)) {
-      await deployReportTemplate(
-        reportSubtype,
-        SUPPORTED_SUBTYPES[reportSubtype],
-        requestsProcessed,
-      );
+      requestsProcessed = [
+        ...requestsProcessed,
+        ...await deployReportTemplate(
+          reportSubtype,
+          SUPPORTED_SUBTYPES[reportSubtype],
+          reportNameToURLMapTarget,
+        )
+      ]
     }
   }
 }
@@ -524,9 +535,14 @@ async function deployReportTemplatesToTargetOrg() {
 async function deployReportTemplate(
   subtypeName,
   subtypeLabel,
-  requestsProcessed,
+  reportNameToURLMapTarget,
 ) {
+  const requestsProcessed = [];
+  console.log(`fine: deploying reports for subtype '${subtypeLabel}'`);
   for (const currentReportName in reportNameToURLMapTarget) {
+    console.log(
+      `fine: deploying '${currentReportName}' report for subtype '${subtypeLabel}'`,
+    );
     const reportVersionName = `${currentReportName}_${subtypeName}`;
     const url = reportNameToURLMapTarget[currentReportName];
 
@@ -549,10 +565,9 @@ async function deployReportTemplate(
         request_url.includes(
           '/servicereport/serviceReportTemplateEditor.apexp',
         ) &&
-        request_post_data &&
-        request_post_data.includes('j_id0%3Af%3AjsonLayout')
+        request_post_data?.includes('j_id0%3Af%3AjsonLayout')
       ) {
-        const regex = jsonLayoutParamRegex;
+        const regex = JSON_LAYOUT_PARAM_REGEX;
         const matchedString = regex.exec(request_post_data)[0];
 
         if (reportNameToJSON[reportVersionName]) {
@@ -563,10 +578,7 @@ async function deployReportTemplate(
             ),
           });
 
-          if (
-            LOG_POST_DATA &&
-            !requestsProcessed.includes(reportVersionName)
-          ) {
+          if (LOG_POST_DATA && !requestsProcessed.includes(reportVersionName)) {
             let dataToWrite = decodeURIComponent(
               reportNameToJSONReplaced[reportVersionName].replace(
                 'j_id0%3Af%3AjsonLayout=',
@@ -579,13 +591,12 @@ async function deployReportTemplate(
               2,
             );
 
-            _writeFile(
-              `${reportVersionName} target org POST data.json`,
+            writeFile(
+              `${reportVersionName}.target.json`,
               dataToWriteFormatted,
-              function (err) {
-                if (err) return console.log(err);
-              },
-            );
+            ).catch(err => {
+              console.error(err);
+            });
           }
 
           requestsProcessed.push(reportVersionName);
@@ -598,6 +609,7 @@ async function deployReportTemplate(
     });
 
     await clickQuickSave(newReportPage);
+    return requestsProcessed;
   }
 }
 

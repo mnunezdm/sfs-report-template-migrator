@@ -105,4 +105,6 @@ dist
 
 .DS_Store
 *POST data*
+*.source.json
+*.target.json
 package-lock.json

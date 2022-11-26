@@ -5,8 +5,6 @@ reportSubtypesToMigrate:
   - "SA_WOLI"
   - "WO"
   - "WOLI"
-createReportsInTargetOrg: True
-runInBackground: False
 writePOSTDataToFile: True
 errorLogFilename: "error.log"
 windowWidth: 1800 #pixels
